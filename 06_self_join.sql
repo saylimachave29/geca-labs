@@ -3,6 +3,11 @@
 
 USE join_lab;
 
--- TODO: SELECT a.name AS person_a, b.name AS person_b, a.dept_id
--- FROM staff a
--- JOIN staff b ON ...
+-- Selecting pairs of staff members from the same department
+SELECT 
+    a.name AS staff_member_1, 
+    b.name AS staff_member_2, 
+    a.dept_id
+FROM staff a
+JOIN staff b ON a.dept_id = b.dept_id
+WHERE a.staff_id < b.staff_id;
