@@ -18,9 +18,6 @@ jobs:
             gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
               -f body="😏 Who are you? Only @s-m-quadri can do it."
             exit 1
-          else
-            gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-              -f body="👍 Got it, I’ll start merging and organizing your submission."
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -49,9 +46,7 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Base branch validated: $BASE_BRANCH"
-          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-            -f body="✅ Base branch validated: \`$BASE_BRANCH\`. Proceeding with merge..."
+          echo "✅ Base branch validated: $BASE_BRANCH — merging."
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
@@ -77,28 +72,48 @@ jobs:
         run: |
           # Save merged branch ref
           git branch merged_state
-          
+
           # Checkout stable to get automation scripts
           git checkout stable
           cp -r automation-scripts /tmp/
-          
+
           # Return to merged branch
           git checkout merged_state
 
       - name: Extract PRN and Branch Info
         run: |
+          HEAD_BRANCH="${{ fromJson(steps.pr.outputs.data).head.ref }}"
           PR_TITLE="${{ fromJson(steps.pr.outputs.data).title }}"
-          ROLL=$(echo "$PR_TITLE" | grep -oP 'BT[0-9A-Z]+' || true)
+
+          # Fork PRs: head ref may be "fork-owner:branch-name"
+          case "$HEAD_BRANCH" in
+            *:*)
+              HEAD_BRANCH="${HEAD_BRANCH#*:}"
+              ;;
+          esac
+
+          ROLL=$(echo "$PR_TITLE" | grep -ioP 'BT[0-9A-Z]+' || true)
+          if [ -z "$ROLL" ]; then
+            ROLL=$(echo "$HEAD_BRANCH" | grep -ioP 'BT[0-9A-Z]+' || true)
+          fi
           if [ -z "$ROLL" ]; then
             gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-              -f body="❌ Could not extract PRN from PR title: \`$PR_TITLE\`"
+              -f body="❌ Could not extract PRN from title (\`$PR_TITLE\`) or branch (\`$HEAD_BRANCH\`)"
             exit 1
           fi
+          ROLL=$(echo "$ROLL" | tr '[:lower:]' '[:upper:]')
           echo "ROLL=$ROLL" >> $GITHUB_ENV
           BASE_BRANCH="${{ fromJson(steps.pr.outputs.data).base.ref }}"
           echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
           ORIGINAL_BRANCH=$(echo "$BASE_BRANCH" | sed 's/^sub-//')
+          # Prefer -v2 variant if it exists (e.g. lab-dbms-05-v2 over lab-dbms-05)
+          if git ls-remote --exit-code origin "${ORIGINAL_BRANCH}-v2" &>/dev/null; then
+            ORIGINAL_BRANCH="${ORIGINAL_BRANCH}-v2"
+          fi
           echo "ORIGINAL_BRANCH=$ORIGINAL_BRANCH" >> $GITHUB_ENV
+          echo "Extracted ROLL=$ROLL BASE_BRANCH=$BASE_BRANCH ORIGINAL_BRANCH=$ORIGINAL_BRANCH"
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
       - name: Determine Lab Folder
         run: |
@@ -128,30 +143,38 @@ jobs:
           LAB_NUM=$(echo "${BASE_BRANCH}" | grep -oP '\d{2}$' || true)
           if [ -z "$LAB_NUM" ]; then
             LAB_NUM="00"
-            gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-              -f body="⚠️ Lab number not found in branch name, defaulting to lab-00."
+            echo "::notice title=Lab folder::Lab number not found in branch name; defaulting to lab-00."
           fi
           LAB_DIR="$LAB_BASE/lab-$LAB_NUM"
           echo "LAB_DIR=$LAB_DIR" >> $GITHUB_ENV
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
-      - name: Move files into PRN folder
+      - name: Organize submission and restore clean lab
         run: |
-          mkdir -p "$LAB_DIR/$ROLL"
-          shopt -s nullglob
-          mv ./*.py "$LAB_DIR/$ROLL"/ || true
-          mv ./*.ipynb "$LAB_DIR/$ROLL"/ || true
-          mv ./*.csv "$LAB_DIR/$ROLL"/ || true
-          mv ./*.sql "$LAB_DIR/$ROLL"/ || true
-          mv ./*.md "$LAB_DIR/$ROLL"/ || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
+          echo "ROLL=$ROLL LAB_DIR=$LAB_DIR ORIGINAL_BRANCH=$ORIGINAL_BRANCH"
 
-      - name: Restore lab working set
-        run: |
-          echo "Restoring from origin/${ORIGINAL_BRANCH}..."
+          # Ensure orphan baseline branch is fetched
+          git fetch origin "${ORIGINAL_BRANCH}"
+
+          # 1. Copy all root-level files to temp (use process substitution, not pipe)
+          mkdir -p /tmp/student_submission
+          while IFS= read -r file; do
+            cp "$file" /tmp/student_submission/
+          done < <(find . -maxdepth 1 -type f)
+          echo "Saved $(ls /tmp/student_submission/ | wc -l) files to temp"
+
+          # 2. Wipe all root-level files
+          find . -maxdepth 1 -type f -delete
+
+          # 3. Restore clean baseline from orphan branch
           git checkout "origin/${ORIGINAL_BRANCH}" -- .
+          echo "Root restored: $(ls -1 | head -20)"
+
+          # 4. Move student files into PRN folder
+          mkdir -p "$LAB_DIR/$ROLL"
+          cp -r /tmp/student_submission/. "$LAB_DIR/$ROLL/"
+          echo "Organized into $LAB_DIR/$ROLL: $(ls $LAB_DIR/$ROLL/)"
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
@@ -159,12 +182,16 @@ jobs:
         run: |
           git config user.name "bot-s-m-quadri"
           git config user.email "access.smq@gmail.com"
-          git add "$LAB_DIR/$ROLL"
-          if git commit -m "Organize submission for $ROLL (merge into ${BASE_BRANCH})"; then
-            git push origin "${BASE_BRANCH}"
+
+          # Stage all changes (student directory + restored clean lab at root)
+          git add -A
+
+          if git commit -m "Organize submission for $ROLL into $LAB_DIR/$ROLL"; then
+            git push origin "HEAD:${BASE_BRANCH}"
+            echo "✓ Successfully organized and pushed submission"
           else
             gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-              -f body="ℹ️ No changes to commit for $ROLL."
+              -f body="ℹ️ No changes to commit for $ROLL (files may already be organized)."
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -199,13 +226,31 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y mysql-client postgresql-client
+          if [ -f automation-scripts/requirements-test.txt ]; then
+            pip install -r automation-scripts/requirements-test.txt
+          else
+            pip install "sqlglot>=24.0.0"
+          fi
+
+      - name: Checkout PR head for testing
+        run: |
+          # Fetch and checkout PR head SHA for validation
+          git fetch origin ${{ fromJson(steps.pr.outputs.data).head.sha }}
+          git checkout ${{ fromJson(steps.pr.outputs.data).head.sha }}
+
+          # Restore automation scripts
+          cp -r /tmp/automation-scripts .
+
+          # Fetch baseline branch for comparison
+          git fetch origin "${ORIGINAL_BRANCH}:refs/remotes/origin/${ORIGINAL_BRANCH}" || true
+
+          echo "Checked out PR head for testing against ${ORIGINAL_BRANCH}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
       - name: Generate comprehensive merge report
         id: merge_report
         run: |
-          # Restore automation scripts
-          cp -r /tmp/automation-scripts .
-          
           # Determine if DBMS lab or other subject
           if [[ "${ORIGINAL_BRANCH}" =~ ^lab-dbms ]]; then
             # Run test to generate comprehensive report
@@ -237,22 +282,15 @@ jobs:
             # Post comprehensive report with test results
             FULL_REPORT=$(cat /tmp/merge_report.md)
             
-            COMMENT_BODY=$(cat <<'EOF'
-🎉 **Congratulations!** Your submission has been accepted and merged.
-
----
-
-EOF
-            )
-            COMMENT_BODY="${COMMENT_BODY}${FULL_REPORT}"
+            COMMENT_BODY=$(printf "🎉 **Congratulations!** Your submission has been accepted and merged.\n\n---\n\n%s" "$FULL_REPORT")
           else
             # Simple acceptance message for non-DBMS labs
             COMMENT_BODY="🎉 **Congratulations!** Your submission has been accepted and merged into \`${BASE_BRANCH}\`."
           fi
-          
+
           # Escape for JSON
           COMMENT_JSON=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
-          
+
           gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
             --input - <<< "$COMMENT_JSON"
         env:

@@ -10,15 +10,111 @@ Includes:
 """
 from __future__ import annotations
 
+import csv
+import json
 import os
 import re
 import subprocess
 import unicodedata
-import csv
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    import pandas as pd
+    from lib.lab_course import LabCourse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_env_file(path: str) -> None:
+    """Load ``KEY=value`` pairs from ``path`` into ``os.environ`` without extra deps.
+
+    Does not override variables already set in the environment (same idea as dotenv).
+    Supports optional single- or double-quoted values.
+    """
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, rest = line.partition("=")
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                val = rest.strip()
+                if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                    val = val[1:-1]
+                os.environ[key] = val
+    except OSError:
+        pass
+
+
+# PRN prefixes treated as Direct Second Year (DSY) — listed last in rosters and reports.
+DSY_PRN_PREFIXES: Tuple[str, ...] = ("BT25S05F",)
+
+
+def is_dsy_prn(prn: str) -> bool:
+    u = (prn or "").strip().upper()
+    return any(u.startswith(pref) for pref in DSY_PRN_PREFIXES)
+
+
+def student_sort_key(prn: str) -> Tuple[int, str]:
+    """Sort key: non-DSY first (0), DSY last (1); then PRN alphabetically."""
+    u = (prn or "").strip().upper()
+    return (1 if is_dsy_prn(u) else 0, u)
+
+
+def load_pull_requests_df(course: "LabCourse") -> "pd.DataFrame":
+    """Return a normalized PR DataFrame with consistent column names.
+
+    Reads ``pr_flat.csv`` (new format) if present, otherwise falls back to
+    ``pull_requests.csv`` (legacy format).  Labels are enriched from
+    ``pr_details.json`` when available.
+
+    Normalized columns: PR Number, PRN, User, Labels, State, Created At,
+    Closed At, Merged At, Title.
+    """
+    import pandas as pd
+
+    flat_path = course.path_in_output("pr_flat.csv")
+    legacy_path = course.pull_requests_csv
+    details_path = course.path_in_output("pr_details.json")
+
+    if os.path.isfile(flat_path):
+        df = pd.read_csv(flat_path)
+        # Build label map from pr_details.json
+        label_map: Dict[int, str] = {}
+        if os.path.isfile(details_path):
+            with open(details_path, encoding="utf-8") as f:
+                details = json.load(f)
+            for pr in details:
+                num = pr.get("number")
+                labels = pr.get("labels", [])
+                if num is not None:
+                    label_map[int(num)] = ", ".join(
+                        lbl if isinstance(lbl, str) else lbl.get("name", "")
+                        for lbl in (labels if isinstance(labels, list) else [])
+                    )
+        df["Labels"] = df["number"].apply(lambda n: label_map.get(int(n), ""))
+        df = df.rename(columns={
+            "number": "PR Number",
+            "prn": "PRN",
+            "user": "User",
+            "state": "State",
+            "created_at": "Created At",
+            "closed_at": "Closed At",
+            "merged_at": "Merged At",
+            "title": "Title",
+        })
+        # merged flag → Merged At: keep merged_at value; if merged==1 but NaN, treat as closed
+        return df
+
+    return pd.read_csv(legacy_path)
 
 # Paths
 STUDENTS_CSV = os.path.join(ROOT, "output", "students.csv")
@@ -83,6 +179,19 @@ def latex_manual_url(lab_num: int) -> str:
     return f"https://s-m-quadri.me/geca/daa/{lab_num:02d}"
 
 
+def lab_titles_dbms() -> Dict[int, str]:
+    return {
+        0: "Python Foundations and SQL Client Environment",
+        1: "Relational Schema Design (DDL)",
+        2: "Inserting, Updating, and Deleting Data (DML)",
+        3: "Built-In Functions, Filtering, and Aggregates",
+        4: "Inner and Outer Joins (Multi-Table Queries)",
+        5: "Stored Procedures, Functions, and Procedural Logic",
+        6: "Views, Scalar and Correlated Subqueries",
+        7: "Conceptual Modeling, Normalization, and Mini-Project",
+    }
+
+
 def lab_titles_default() -> Dict[int, str]:
     return {
         0: "Python Warm-up and Submission Guidelines",
@@ -105,6 +214,34 @@ class Student:
     name: str
 
 
+# Lines like ``1 BT24F05F001 ABHYANKAR RAGHAV DHANANJAY`` in a plain-text roll export.
+_ROLLS_LINE_RE = re.compile(r"^\s*\d+\s+(BT\d+[FS]\d+F\d{3})\s+(.+)$", re.MULTILINE)
+
+
+def parse_students_from_rolls_raw_text(text: str) -> List[Student]:
+    """Extract PRN/name pairs from pasted college roll text.
+
+    Ordering is normalized by :func:`student_sort_key`: regular second-year (SY) cohort
+    first, direct second-year (DSY) last (see :data:`DSY_PRN_PREFIXES`), then by PRN.
+    """
+    out: Dict[str, str] = {}
+    for m in _ROLLS_LINE_RE.finditer(text or ""):
+        prn = m.group(1).strip().upper()
+        name = re.sub(r"\s+", " ", m.group(2).strip())
+        if prn and name:
+            out[prn] = name
+    students = [Student(prn=k, name=v) for k, v in out.items()]
+    students.sort(key=lambda s: student_sort_key(s.prn))
+    return students
+
+
+def parse_students_from_rolls_raw_path(path: str) -> List[Student]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with open(path, encoding="utf-8") as f:
+        return parse_students_from_rolls_raw_text(f.read())
+
+
 def read_students(csv_path: Optional[str] = None) -> List[Student]:
     path = csv_path or STUDENTS_CSV
     students: List[Student] = []
@@ -117,11 +254,69 @@ def read_students(csv_path: Optional[str] = None) -> List[Student]:
             name = str(row.get("Name", "")).strip()
             if prn:
                 students.append(Student(prn=prn, name=name))
+    students.sort(key=lambda s: student_sort_key(s.prn))
     return students
+
+
+# Removed after successful pdflatex so output dirs keep only .tex and .pdf.
+_LATEX_ARTIFACT_SUFFIXES: Tuple[str, ...] = (
+    ".aux",
+    ".log",
+    ".out",
+    ".toc",
+    ".nav",
+    ".snm",
+    ".vrb",
+    ".fls",
+    ".fdb_latexmk",
+    ".synctex.gz",
+    ".bbl",
+    ".blg",
+    ".bcf",
+    ".run.xml",
+    ".xdv",
+)
+
+
+def _cleanup_latex_artifacts(out_dir: str, stem: str) -> None:
+    for suf in _LATEX_ARTIFACT_SUFFIXES:
+        path = os.path.join(out_dir, stem + suf)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def cleanup_latex_auxiliary_files_in_directory(out_dir: str) -> None:
+    """Drop pdflatex sidecars in ``out_dir`` so only ``.tex`` / ``.pdf`` (and similar sources) remain.
+
+    Intended for folders like ``output/<course>/writeups`` after builds; skips non-regular files.
+    """
+    if not os.path.isdir(out_dir):
+        return
+    artifacts = set(_LATEX_ARTIFACT_SUFFIXES)
+    for fname in os.listdir(out_dir):
+        path = os.path.join(out_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        low = fname.lower()
+        if low.endswith(".tex") or low.endswith(".pdf"):
+            continue
+        hit = False
+        for suf in artifacts:
+            if low.endswith(suf.lower()):
+                hit = True
+                break
+        if hit:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def compile_tex(tex_path: str, out_dir: Optional[str] = None) -> None:
     out_dir = out_dir or os.path.dirname(tex_path)
+    stem = os.path.splitext(os.path.basename(tex_path))[0]
     cmd = [
         "pdflatex", "-interaction=nonstopmode", "-halt-on-error",
         f"-output-directory={out_dir}", tex_path,
@@ -140,3 +335,4 @@ def compile_tex(tex_path: str, out_dir: Optional[str] = None) -> None:
             except Exception:
                 pass
             raise
+    _cleanup_latex_artifacts(out_dir, stem)

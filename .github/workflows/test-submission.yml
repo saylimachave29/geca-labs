@@ -25,6 +25,7 @@ jobs:
               number: pr.number,
               base: pr.base.ref,
               head: pr.head.ref,
+              title: pr.title,
               headSha: pr.head.sha,
               headRepo: pr.head.repo.full_name,
               baseRepo: pr.base.repo.full_name
@@ -36,14 +37,23 @@ jobs:
           HEAD_BRANCH="${{ fromJson(steps.pr.outputs.result).head }}"
           PR_TITLE="${{ fromJson(steps.pr.outputs.result).title }}"
 
-          # Extract lab branch pattern (lab-{subject}-{NN})
-          if [[ "$HEAD_BRANCH" =~ lab-dbms-[0-9]{2} ]]; then
-            LAB_BRANCH=$(echo "$HEAD_BRANCH" | grep -oP 'lab-dbms-\d{2}')
-          elif [[ "$HEAD_BRANCH" =~ lab-dbms ]]; then
+          # Fork PRs: head ref may be "fork-owner:branch-name"
+          case "$HEAD_BRANCH" in
+            *:*)
+              HEAD_BRANCH="${HEAD_BRANCH#*:}"
+              ;;
+          esac
+
+          # Baseline branch: lab-dbms-{N} with N one or two digits (e.g. lab-dbms-6-v2 → lab 06)
+          CLEAN_HEAD=$(echo "$HEAD_BRANCH" | sed 's/-v[0-9]*$//')
+          if [[ "$CLEAN_HEAD" =~ ^lab-dbms-([0-9]{1,2})$ ]]; then
+            N=$(printf '%02d' "$((10#${BASH_REMATCH[1]}))")
+            LAB_BRANCH="lab-dbms-${N}"
+          elif [[ "$CLEAN_HEAD" =~ ^lab-dbms$ ]] || [[ "$HEAD_BRANCH" =~ ^lab-dbms(-v[0-9]*)?$ ]]; then
             LAB_BRANCH="lab-dbms-00"
           else
             gh api repos/${{ github.repository }}/issues/${{ fromJson(steps.pr.outputs.result).number }}/comments \
-              -f body="Cannot determine DBMS lab from branch: \`$HEAD_BRANCH\`. Expected format: \`lab-dbms-NN\`"
+              -f body="Cannot determine DBMS lab from branch: \`$HEAD_BRANCH\`. Expected format: \`lab-dbms-NN\` or \`lab-dbms-N-v2\`"
             exit 1
           fi
 
@@ -60,13 +70,6 @@ jobs:
           echo "LAB_BRANCH=$LAB_BRANCH" >> $GITHUB_ENV
           echo "PRN=$PRN" >> $GITHUB_ENV
           echo "Testing against baseline: $LAB_BRANCH for PRN: $PRN"
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
-
-      - name: Acknowledge test request
-        run: |
-          gh api repos/${{ github.repository }}/issues/${{ fromJson(steps.pr.outputs.result).number }}/comments \
-            -f body="Running tests for \`${LAB_BRANCH}\`... Please wait."
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
 
@@ -95,18 +98,20 @@ jobs:
           echo "Testing PR head with baseline: ${LAB_BRANCH}"
           ls -la automation-scripts/
 
-      - name: Install SQL parsers
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y mysql-client postgresql-client
-
-          mysql --version
-          psql --version
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install test dependencies (SQL syntax validation)
+        run: |
+          # Prefer requirements file when present on ``stable``; otherwise install sqlglot directly
+          # (avoids CI failure before ``requirements-test.txt`` is merged to the branch used for restore).
+          if [ -f automation-scripts/requirements-test.txt ]; then
+            pip install -r automation-scripts/requirements-test.txt
+          else
+            pip install "sqlglot>=24.0.0"
+          fi
 
       - name: Run tests
         id: test
@@ -125,11 +130,9 @@ jobs:
           EXIT_CODE=$?
           set -e
 
-          # Save output for next step
-          echo "$OUTPUT" > /tmp/test_output.md
-        env:
-          LAB_BRANCH: ${{ env.LAB_BRANCH }}
-          PRN: ${{ env.PRN }}
+          # One PR comment later: prepend marker (same line old "Acknowledge" step used) for tooling
+          HEADER=$(printf 'Running tests for `%s`... report below.' "$LAB_BRANCH")
+          printf '%s\n\n%s\n' "$HEADER" "$OUTPUT" > /tmp/test_output.md
 
           # Determine status
           if [ $EXIT_CODE -eq 0 ]; then
@@ -139,6 +142,9 @@ jobs:
           fi
 
           echo "Test completed with exit code: $EXIT_CODE"
+        env:
+          LAB_BRANCH: ${{ env.LAB_BRANCH }}
+          PRN: ${{ env.PRN }}
 
       - name: Post test results
         run: |
